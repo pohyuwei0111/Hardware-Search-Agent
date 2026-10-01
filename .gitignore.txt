@@ -1,0 +1,6 @@
+__pycache__/
+venv/
+*.xlsx
+*.csv
+agent_keys.json
+.env
