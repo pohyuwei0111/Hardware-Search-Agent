@@ -94,8 +94,41 @@ async def relax_query(client, original_query, status_container):
     )
     return response.choices[0].message.content.strip().replace('"', '')
 
-async def search_google_snippets_async(platform_domain, current_query, target_count, serp_client):
-    search_query = f"site:{platform_domain} {current_query}"
+async def optimize_query_with_llm(client, user_query, status_container):
+    status_container.info("🧠 LLM analyzing query intent and building exclusion filters...")
+    
+    system_prompt = """You are an intelligent search pre-processor for an e-commerce scraper.
+Your job is to analyze the user's raw search query and format it for a highly accurate search engine request.
+
+Rules:
+1. Fix Contradictions: If the query mixes distinct products (e.g., "ipad air pro"), resolve it to the most logical premium target (e.g., "Apple iPad Pro M4").
+2. Dynamic Exclusions: Generate a string of negative keywords (using the '-' prefix) to block accessories, parts, or irrelevant items. 
+   - If searching for a LAPTOP/TABLET, exclude: -case -cover -screen -protector -charger -battery -keyboard
+   - If searching for a MICROCONTROLLER, exclude: -cable -jumper -header
+   - IF the user EXPLICITLY wants an accessory (e.g., "rtx 4090 waterblock" or "ipad case"), DO NOT exclude those terms!
+3. Output strictly valid JSON with exactly two keys: "refined_query" and "negative_keywords".
+"""
+
+    try:
+        response = await client.chat.completions.create(
+            model="gemini-3.5-flash-lite",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Raw Query: {user_query}"}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        
+        data = json_repair.loads(response.choices[0].message.content)
+        return data.get("refined_query", user_query), data.get("negative_keywords", "")
+    except Exception as e:
+        return user_query, "-case -cover -protector" # Safe fallback
+        
+async def search_google_snippets_async(platform_domain, current_query, negative_keywords, target_count, serp_client):
+    # Combine the domain, the LLM-refined query, and the LLM-generated exclusions
+    search_query = f"site:{platform_domain} {current_query} {negative_keywords}"
+    
     try:
         raw_results = await asyncio.to_thread(serp_client.search, engine="google", q=search_query, gl="my", num=20)
         results = dict(raw_results)
@@ -152,9 +185,17 @@ async def run_shopping_agent(query, domains, keys, status_container):
     fc = Firecrawl(api_key=keys['fc'])
     serp_client = serpapi.Client(api_key=keys['serp'])
     
+    # 1. SMART PRE-PROCESSING TRIGGER
+    refined_query, neg_keywords = await optimize_query_with_llm(client, query, status_container)
+    status_container.success(f"🎯 Target Locked: '{refined_query}' (Excluding: {neg_keywords})")
+    
     target_count = 10 // len(domains) if domains else 0
     
-    domain_tasks = [process_single_domain(domain, query, target_count, client, serp_client, fc, status_container) for domain in domains]
+    # Pass the refined data to the domain tasks
+    domain_tasks = [
+        process_single_domain(domain, refined_query, neg_keywords, target_count, client, serp_client, fc, status_container) 
+        for domain in domains
+    ]
     results = await asyncio.gather(*domain_tasks)
     
     all_extracted_text = "".join(results)
