@@ -1,0 +1,9 @@
+streamlit
+extra-streamlit-components
+pandas
+openpyxl
+serpapi
+openai
+firecrawl-py
+json-repair
+requests
