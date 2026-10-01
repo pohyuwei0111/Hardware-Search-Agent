@@ -94,21 +94,17 @@ async def relax_query(client, original_query, status_container):
     )
     return response.choices[0].message.content.strip().replace('"', '')
 
-async def optimize_query_with_llm(client, user_query, status_container):
-    status_container.info("🧠 LLM analyzing query intent and building exclusion filters...")
-    
+async def validate_and_optimize_query(client, user_query):
     system_prompt = """You are an intelligent search pre-processor for an e-commerce scraper.
-Your job is to analyze the user's raw search query and format it for a highly accurate search engine request.
+    Your job is to analyze the user's raw search query.
 
-Rules:
-1. Fix Contradictions: If the query mixes distinct products (e.g., "ipad air pro"), resolve it to the most logical premium target (e.g., "Apple iPad Pro M4").
-2. Dynamic Exclusions: Generate a string of negative keywords (using the '-' prefix) to block accessories, parts, or irrelevant items. 
-   - If searching for a LAPTOP/TABLET, exclude: -case -cover -screen -protector -charger -battery -keyboard
-   - If searching for a MICROCONTROLLER, exclude: -cable -jumper -header
-   - IF the user EXPLICITLY wants an accessory (e.g., "rtx 4090 waterblock" or "ipad case"), DO NOT exclude those terms!
-3. Output strictly valid JSON with exactly two keys: "refined_query" and "negative_keywords".
-"""
-
+    Rules:
+    1. VALIDATE: Check if the product physically exists and makes sense. (e.g., "RTX 4050 16GB VRAM" is impossible as the RTX 4050 maxes at 6GB. "iPad Air Pro" is a contradiction).
+    2. If the query is impossible, contradictory, or highly confusing, set "is_valid" to false and provide a helpful "feedback" message explaining why and suggesting a corrected search term.
+    3. CHECK SPECIFICITY: If the query is valid but broad (e.g., just "RTX 4050 laptop" or "iPad Air"), set "needs_clarification" to true, and provide a short "clarification_message" letting the user know there are various specs (like RAM, storage, or screen size) and they might want to be more specific in the future. If it is already highly specific, set it to false.
+    4. If valid, set "is_valid" to true, generate a "refined_query", and generate "negative_keywords" (using '-' prefix to block accessories if searching for a main device).
+    5. Output strictly valid JSON with keys: "is_valid" (boolean), "feedback" (string), "needs_clarification" (boolean), "clarification_message" (string), "refined_query" (string), "negative_keywords" (string)."""
+    
     try:
         response = await client.chat.completions.create(
             model="gemini-3.5-flash-lite",
@@ -119,11 +115,10 @@ Rules:
             temperature=0.1,
             response_format={"type": "json_object"}
         )
-        
-        data = json_repair.loads(response.choices[0].message.content)
-        return data.get("refined_query", user_query), data.get("negative_keywords", "")
-    except Exception as e:
-        return user_query, "-case -cover -protector" # Safe fallback
+        return json_repair.loads(response.choices[0].message.content)
+    except Exception:
+        # Failsafe fallback
+        return {"is_valid": True, "refined_query": user_query, "negative_keywords": "", "feedback": "", "needs_clarification": False, "clarification_message": ""}
         
 async def search_google_snippets_async(platform_domain, current_query, negative_keywords, target_count, serp_client):
     # Combine the domain, the LLM-refined query, and the LLM-generated exclusions
@@ -153,13 +148,13 @@ async def scrape_with_firecrawl_async(url, snippet, fc):
     except Exception:
         return f"Snippet Data Fallback:\n{snippet}"
 
-async def process_single_domain(domain, query, target_count, client, serp_client, fc, status_container):
+async def process_single_domain(domain, query, neg_keywords, target_count, client, serp_client, fc, status_container):
     current_query = query
     products = []
     
     for tier in range(1, 3):
         status_container.text(f"[{domain}] Tier {tier} Search: {current_query}")
-        links = await search_google_snippets_async(domain, current_query, target_count, serp_client)
+        links = await search_google_snippets_async(domain, current_query, neg_keywords, target_count, serp_client)
         if links:
             products = links
             break
@@ -180,18 +175,13 @@ async def process_single_domain(domain, query, target_count, client, serp_client
         
     return extracted
 
-async def run_shopping_agent(query, domains, keys, status_container):
+async def run_shopping_agent(refined_query, neg_keywords, domains, keys, status_container):
     client = AsyncOpenAI(base_url="https://generativelanguage.googleapis.com/v1beta/openai/", api_key=keys['gemini'])
     fc = Firecrawl(api_key=keys['fc'])
     serp_client = serpapi.Client(api_key=keys['serp'])
     
-    # 1. SMART PRE-PROCESSING TRIGGER
-    refined_query, neg_keywords = await optimize_query_with_llm(client, query, status_container)
-    status_container.success(f"🎯 Target Locked: '{refined_query}' (Excluding: {neg_keywords})")
-    
     target_count = 10 // len(domains) if domains else 0
     
-    # Pass the refined data to the domain tasks
     domain_tasks = [
         process_single_domain(domain, refined_query, neg_keywords, target_count, client, serp_client, fc, status_container) 
         for domain in domains
@@ -204,7 +194,8 @@ async def run_shopping_agent(query, domains, keys, status_container):
 
     status_container.warning("Passing ALL combined domain data to Gemini Analyst Model...")
     
-    system_prompt = f"""You are an Expert Hardware Procurement Analyst. Target user requirement: "{query}".
+    # FIXED: Replaced '{query}' with '{refined_query}'
+    system_prompt = f"""You are an Expert Hardware Procurement Analyst. Target user requirement: "{refined_query}".
 Rules:
 1. Parse ALL provided products into structured data (platform, model, specs, price, link).
 2. From all valid products, select exactly THREE distinct items for your final recommendation:
@@ -266,27 +257,55 @@ def generate_excel_bytes(data, sheet_name, column_widths):
 # MAIN UI LAYOUT
 # ==========================================
 st.title("Hi there, what hardware are you looking for?")
-search_input = st.text_input("Search for hardware, components, or modules...", placeholder="e.g. RTX 5050 laptop, 24V 20A Power Supply...")
+
+# 1. Create empty placeholders ABOVE the search bar for LLM feedback
+error_placeholder = st.empty()
+info_placeholder = st.empty()
+
+search_input = st.text_input("Search for hardware, components, or modules...", placeholder="e.g. RTX 4050 laptop, 24V 20A Power Supply...")
 search_btn = st.button("Search & Analyze", type="primary")
 
 if search_btn:
     if not (serp_key and fc_key and gemini_key):
-        st.error("⚠️ Please enter all API keys in the left sidebar to proceed.")
+        error_placeholder.error("⚠ Please enter all API keys in the left sidebar to proceed.")
     elif not selected_domains:
-        st.error("⚠️ Please select at least one domain to target.")
+        error_placeholder.error("⚠️ Please select at least one domain to target.")
     elif not search_input:
-        st.error("⚠️ Please enter a product to search for.")
+        error_placeholder.error("⚠️ Please enter a product to search for.")
     else:
-        with st.status("Initializing Shopping Agent...", expanded=True) as status_box:
-            keys = {'serp': serp_key, 'fc': fc_key, 'gemini': gemini_key}
-            analyzed, all_parsed = asyncio.run(run_shopping_agent(search_input, selected_domains, keys, status_box))
-            
-            st.session_state.analyzed_data = analyzed
-            st.session_state.all_parsed_data = all_parsed
-            st.session_state.search_query = search_input
-            
-            status_box.update(label="Analysis Complete!", state="complete", expanded=False)
+        # Initialize Gemini client specifically for the quick validation step
+        client = AsyncOpenAI(base_url="https://generativelanguage.googleapis.com/v1beta/openai/", api_key=gemini_key)
+        
+        with st.spinner("🧠 Analyzing query intent..."):
+            validation_data = asyncio.run(validate_and_optimize_query(client, search_input))
+        
+        # 2. HALT AND WARN if the LLM detects an impossible/contradictory query
+        if not validation_data.get("is_valid", True):
+            error_placeholder.warning(f"🤔 **Clarification Needed:** {validation_data.get('feedback')}")
+        
+        # 3. Proceed only if valid
+        else:
+            # Check if we should notify the user about broad specs, but don't stop the flow
+            if validation_data.get("needs_clarification", False):
+                info_placeholder.info(f"💡 **Tip:** {validation_data.get('clarification_message')}")
 
+            with st.status("Initializing Shopping Agent...", expanded=True) as status_box:
+                refined = validation_data.get('refined_query', search_input)
+                neg_keys = validation_data.get('negative_keywords', '')
+                
+                status_box.success(f"🎯 Target Locked: '{refined}' (Excluding: {neg_keys})")
+                
+                keys = {'serp': serp_key, 'fc': fc_key, 'gemini': gemini_key}
+                
+                # Pass the validated and refined data into the main agent
+                analyzed, all_parsed = asyncio.run(run_shopping_agent(refined, neg_keys, selected_domains, keys, status_box))
+                
+                st.session_state.analyzed_data = analyzed
+                st.session_state.all_parsed_data = all_parsed
+                st.session_state.search_query = search_input
+                
+                status_box.update(label="Analysis Complete!", state="complete", expanded=False)
+                
 # RENDER RESULTS
 if st.session_state.analyzed_data:
     st.markdown("### ✨ Curated Hardware Recommendations")
@@ -339,7 +358,7 @@ if st.session_state.analyzed_data:
             {'A': 20, 'B': 30, 'C': 60, 'D': 20, 'E': 50}
         )
         col2.download_button(
-            label="🛠️️ Download ALL Structured Products (.xlsx)",
+            label="🛠 Download ALL Structured Products (.xlsx)",
             data=excel_raw,
             file_name=f"{safe_filename}_all_products.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
